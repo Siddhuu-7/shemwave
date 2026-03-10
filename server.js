@@ -1,12 +1,12 @@
 const express = require("express");
 const admin = require("firebase-admin");
-let serviceAccount;
+let serviceAccount = require("./serviceAccountKey.json");
 
-if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-} else {
-  serviceAccount = require("./serviceAccountKey.json");
-}
+// if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+//   serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+// } else {
+//   serviceAccount
+// }
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -14,7 +14,7 @@ const PORT = process.env.PORT || 3000;
 // Firebase initialization
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  databaseURL: "https://shemwave-b5f5d-default-rtdb.firebaseio.com"
+  databaseURL: "https://shemwave-f1d00-default-rtdb.firebaseio.com"
 });
 
 const db = admin.database();
