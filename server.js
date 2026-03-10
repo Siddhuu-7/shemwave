@@ -1,17 +1,16 @@
-const express = require("express");
 const admin = require("firebase-admin");
-let serviceAccount = require("./serviceAccountKey.json");
-
-// if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-//   serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-// } else {
-//   serviceAccount
-// }
+let serviceAccount ;
+const express=require("express")
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+} else {
+  serviceAccount="./serviceAccountKey.json"
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Firebase initialization
+
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
   databaseURL: "https://shemwave-f1d00-default-rtdb.firebaseio.com"
@@ -19,12 +18,12 @@ admin.initializeApp({
 
 const db = admin.database();
 
-// Health route (used to keep server alive)
+
 app.get("/", (req, res) => {
   res.send("Shemwave notification server running");
 });
 
-// Firebase listener
+
 db.ref("/").on("child_changed", async (snapshot) => {
 
   const userId = snapshot.key;
@@ -85,4 +84,4 @@ db.ref("/").on("child_changed", async (snapshot) => {
 // Start server
 app.listen(PORT, () => {
   console.log(`Shemwave server running on port ${PORT}`);
-});
+});  
