@@ -29,58 +29,62 @@ db.ref("/").on("child_changed", async (snapshot) => {
   const userId = snapshot.key;
   const userData = snapshot.val();
 
+  // Skip non-user keys
+  if (userId === 'credentials') return;
+
+  const token = userData.fcmToken;
+  if (!token) return;
+
   for (let key in userData) {
+    if (!key.startsWith("farm_")) continue;  // ✅ only farm_ keys, not FarmNames
 
-    if (key.startsWith("farm")) {
+    const farm = userData[key];
+    if (!farm || typeof farm !== 'object') continue;
 
-      const farm = userData[key];
+    // Find all motors: m1, m2, m3...
+    const motorKeys = Object.keys(farm).filter(k => /^m\d+$/.test(k));
 
-      for (let motorKey in farm) {
+    for (let motorKey of motorKeys) {
+      const motorNumber = motorKey.replace('m', '');         // "1", "2"
+      const mainMotorOn = farm[motorKey] === true;           // m1 = true/false
 
-        if (motorKey.startsWith("working")) {
+      if (!mainMotorOn) continue;  // main motor is off, skip
 
-          const motorNumber = motorKey.replace("working", "");
+      const motorName = farm[`m${motorNumber}name`] || `Motor ${motorNumber}`;  // ✅ m1name
 
-          const workingStatus = farm[motorKey];
-          const motorEnabled = farm[`m${motorNumber}`];
+      // Find all sub-motors for this motor: m1working1, m1working2...
+      const subMotorKeys = Object.keys(farm).filter(k =>
+        new RegExp(`^m${motorNumber}working\\d+$`).test(k)  // ✅ m1working1, m1working2
+      );
 
-          if (motorEnabled === true && workingStatus === false) {
+      for (let subKey of subMotorKeys) {
+        const subIndex = subKey.replace(`m${motorNumber}working`, '');
+        const subWorking = farm[subKey];
 
-            const motorName = farm[`mname${motorNumber}`];
+        if (subWorking === false) {  // main ON + sub OFF = alert
+          const subName = farm[`m${motorNumber}name${subIndex}`] || `Sub Motor ${subIndex}`;  // ✅ m1name1
 
-            console.log(`Motor stopped: ${motorName} in ${key}`);
+          console.log(`Alert: ${subName} of ${motorName} stopped in ${key}`);
 
-            const token = userData.fcmToken;
+          const message = {
+            notification: {
+              title: '⚠️ Motor Alert',
+              body: `${subName} of ${motorName} stopped working!`,
+            },
+            token,
+          };
 
-            if (!token) return;
-
-            const message = {
-              notification: {
-                title: "Motor Alert",
-                body: `${motorName} stopped working in ${key}`
-              },
-              token: token
-            };
-
-            try {
-              await admin.messaging().send(message);
-              console.log("Notification sent");
-            } catch (err) {
-              console.log("Notification error:", err);
-            }
-
+          try {
+            await admin.messaging().send(message);
+            console.log(`Notification sent for ${subName}`);
+          } catch (err) {
+            console.error('Notification error:', err);
           }
-
         }
-
       }
-
     }
-
   }
-
 });
-
 // Start server
 app.listen(PORT, () => {
   console.log(`Shemwave server running on port ${PORT}`);
