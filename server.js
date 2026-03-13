@@ -85,7 +85,12 @@ db.ref("/").on("value", (snapshot) => {
 
     const userData  = allData[userId];
     const schedules = userData?.Schedules;
-    const fcmToken  = userData?.fcmToken;
+
+    /* — Collect ALL fcmToken* keys (fcmToken, fcmToken2, fcmToken3 …) — */
+    const fcmTokens = Object.keys(userData)
+      .filter(k => /^fcmToken\d*$/.test(k))
+      .map(k => userData[k])
+      .filter(Boolean);
 
     /* — User has no schedules → clear cache entry — */
     if (!schedules || Object.keys(schedules).length === 0) {
@@ -113,16 +118,71 @@ db.ref("/").on("value", (snapshot) => {
       }
     }
 
-    /* — Rebuild cache entry — */
+    /* — Rebuild cache entry (store token list) — */
     scheduleCache[userId] = {};
     for (const scheduleId in schedules) {
-      scheduleCache[userId][scheduleId] = { ...schedules[scheduleId], fcmToken };
+      scheduleCache[userId][scheduleId] = { ...schedules[scheduleId], fcmTokens };
     }
 
     const count = Object.keys(scheduleCache[userId]).length;
-    console.log(`[CACHE] 📋 ${userId}: ${count} schedule(s) cached`);
+    console.log(`[CACHE] 📋 ${userId}: ${count} schedule(s) cached — ${fcmTokens.length} FCM token(s) stored`);
   }
 });
+
+/* ================================================================
+   HELPER — SEND TO ALL FCM TOKENS
+   Sends a message to every stored token for a user.
+   Silently removes tokens that Firebase rejects as invalid/expired.
+================================================================ */
+const INVALID_TOKEN_CODES = new Set([
+  "messaging/registration-token-not-registered",
+  "messaging/invalid-registration-token",
+  "messaging/invalid-argument",
+]);
+
+/**
+ * @param {string}   userId  — Firebase user key
+ * @param {string[]} tokens  — Array of FCM tokens
+ * @param {object}   message — FCM message payload (without `token`)
+ */
+const sendToAllTokens = async (userId, tokens, message) => {
+  if (!tokens || tokens.length === 0) {
+    console.warn(`[NOTIFY] ⚠️  No FCM tokens found — user: ${userId}`);
+    return;
+  }
+
+  for (const token of tokens) {
+    const shortToken = `…${token.slice(-8)}`;
+    try {
+      await admin.messaging().send({ ...message, token });
+      console.log(`[NOTIFY] 📲 Sent to ${shortToken} — user: ${userId}`);
+    } catch (err) {
+      const isInvalid = INVALID_TOKEN_CODES.has(err.code) ||
+        (err.message || "").toLowerCase().includes("not registered") ||
+        (err.message || "").toLowerCase().includes("invalid registration");
+
+      if (isInvalid) {
+        console.warn(`[NOTIFY] 🗑  Invalid/expired token ${shortToken} — removing from DB`);
+        try {
+          /* Find which fcmToken* key holds this value and delete it */
+          const snap     = await db.ref(`/${userId}`).once("value");
+          const userData = snap.val() || {};
+          for (const key of Object.keys(userData)) {
+            if (/^fcmToken\d*$/.test(key) && userData[key] === token) {
+              await db.ref(`/${userId}/${key}`).remove();
+              console.log(`[NOTIFY] ✅ Removed stale key "${key}" — user: ${userId}`);
+              break;
+            }
+          }
+        } catch (removeErr) {
+          console.error(`[NOTIFY] ❌ Failed to remove stale token — ${removeErr.message}`);
+        }
+      } else {
+        console.error(`[NOTIFY] ❌ Push failed for ${shortToken} — ${err.message}`);
+      }
+    }
+  }
+};
 
 /* ================================================================
    SECTION 2 — MOTOR ALERT LISTENER
@@ -140,8 +200,14 @@ db.ref("/").on("child_changed", async (snapshot) => {
   if (userId === "credentials") return;
 
   const userData = snapshot.val();
-  const token    = userData?.fcmToken;
-  if (!token) return;
+
+  /* — Collect ALL fcmToken* keys for this user — */
+  const tokens = Object.keys(userData)
+    .filter(k => /^fcmToken\d*$/.test(k))
+    .map(k => userData[k])
+    .filter(Boolean);
+
+  if (tokens.length === 0) return; // no tokens → nothing to notify
 
   // Iterate over all top-level keys that look like farm data nodes
   for (const farmKey in userData) {
@@ -155,7 +221,7 @@ db.ref("/").on("child_changed", async (snapshot) => {
       const motorNum = motorKey.replace("M", "");
       if (farm[motorKey] !== true) continue;  // main motor must be ON
 
-      const motorName  = farm[`M${motorNum}name`] || `Motor ${motorNum}`;
+      const motorName = farm[`M${motorNum}name`] || `Motor ${motorNum}`;
 
       // Find sub-motor status keys (M1working1, M1working2 …)
       const subKeys = Object.keys(farm).filter((k) =>
@@ -168,20 +234,14 @@ db.ref("/").on("child_changed", async (snapshot) => {
         const subIdx  = subKey.replace(`M${motorNum}working`, "");
         const subName = farm[`M${motorNum}name${subIdx}`] || `Sub Motor ${subIdx}`;
 
-        console.log(`[MOTOR] ⚠️  ${subName} of "${motorName}" stopped — user: ${userId}`);
+        console.log(`[MOTOR] ⚠️  ${subName} of "${motorName}" stopped — user: ${userId} — notifying ${tokens.length} device(s)`);
 
-        try {
-          await admin.messaging().send({
-            notification: {
-              title: "⚠️ Motor Alert",
-              body:  `${subName} of ${motorName} has stopped working!`,
-            },
-            token,
-          });
-          console.log(`[MOTOR] 📲 Push notification sent — user: ${userId}`);
-        } catch (err) {
-          console.error(`[MOTOR] ❌ Push failed — ${err.message}`);
-        }
+        await sendToAllTokens(userId, tokens, {
+          notification: {
+            title: "⚠️ Motor Alert",
+            body:  `${subName} of ${motorName} has stopped working!`,
+          },
+        });
       }
     }
   }
@@ -323,31 +383,31 @@ app.get("/", (req, res) => {
 });
 
 /** GET /cleanup — wipes all user data, preserves credentials (admin only) */
-// app.get("/cleanup", async (req, res) => {
-//   try {
-//     const credSnap    = await db.ref("/credentials").once("value");
-//     const credentials = credSnap.val();
+app.get("/cleanup", async (req, res) => {
+  try {
+    const credSnap    = await db.ref("/credentials").once("value");
+    const credentials = credSnap.val();
 
-//     const rootSnap = await db.ref("/").once("value");
-//     const allData  = rootSnap.val();
+    const rootSnap = await db.ref("/").once("value");
+    const allData  = rootSnap.val();
 
-//     const deleted = [];
-//     for (const key in allData) {
-//       if (key === "credentials") continue;
-//       await db.ref(`/${key}`).remove();
-//       console.log(`[CLEANUP] 🗑  Deleted: ${key}`);
-//       deleted.push(key);
-//     }
+    const deleted = [];
+    for (const key in allData) {
+      if (key === "credentials") continue;
+      await db.ref(`/${key}`).remove();
+      console.log(`[CLEANUP] 🗑  Deleted: ${key}`);
+      deleted.push(key);
+    }
 
-//     await db.ref("/credentials").set(credentials);
-//     console.log("[CLEANUP] ✅ Credentials restored");
+    await db.ref("/credentials").set(credentials);
+    console.log("[CLEANUP] ✅ Credentials restored");
 
-//     res.json({ status: "✅ Cleanup done", kept: "credentials", deleted });
-//   } catch (err) {
-//     console.error(`[CLEANUP] ❌ Error: ${err.message}`);
-//     res.status(500).json({ error: err.message });
-//   }
-// });
+    res.json({ status: "✅ Cleanup done", kept: "credentials", deleted });
+  } catch (err) {
+    console.error(`[CLEANUP] ❌ Error: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 /* ================================================================
    SECTION 5 — SERVER START
