@@ -1,65 +1,217 @@
-const admin = require("firebase-admin");
+/**
+ * server.js — Shemwave Automation Server
+ *
+ * Responsibilities:
+ *  1. Listen to Firebase in real-time and cache all user schedules
+ *  2. Execute scheduled appliance actions at the right time (IST)
+ *  3. Send push notifications when a farm sub-motor stops working
+ *  4. Expose a health-check endpoint at GET /
+ *  5. Expose a cleanup endpoint at GET /cleanup (admin use)
+ *
+ * Firebase key schema
+ *  /<userId>/Schedules/<id>   — schedule objects
+ *  /<userId>/<farmName>/M1    — farm motor on/off
+ *  /<userId>/<farmName>/M1name<n>   — sub-motor names
+ *  /<userId>/<farmName>/M1working<n>  — sub-motor status
+ */
+
+
+
+const admin   = require("firebase-admin");
 const express = require("express");
 
-let serviceAccount;
-if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-} else {
-  serviceAccount = require("./serviceAccountKey.json");
-}
+/* ================================================================
+   FIREBASE INIT
+================================================================ */
+const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT
+  ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+  : require("./serviceAccountKey.json");
 
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
+  credential:  admin.credential.cert(serviceAccount),
   databaseURL: "https://shemwave-f1d00-default-rtdb.firebaseio.com",
 });
 
-const db = admin.database();
+const db  = admin.database();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 /* ================================================================
-   TIMEZONE CONFIG — IST is UTC+5:30
+   TIMEZONE HELPERS — all times shown/matched in IST (UTC+5:30)
 ================================================================ */
-const USER_TIMEZONE = "Asia/Kolkata";
+const IST_TIMEZONE = "Asia/Kolkata";
 
-const getNowInUserTZ = () => {
-  const now = new Date();
-  const tzString = now.toLocaleString("en-US", { timeZone: USER_TIMEZONE });
-  const tzDate = new Date(tzString);
+/**
+ * Returns the current wall-clock time interpreted in IST.
+ * @returns {{ hour, minute, day, fullTime }}
+ */
+const getNowIST = () => {
+  const now      = new Date();
+  const tzString = now.toLocaleString("en-US", { timeZone: IST_TIMEZONE });
+  const d        = new Date(tzString);
+  const h        = d.getHours();
+  const m        = d.getMinutes();
   return {
-    hour: tzDate.getHours(),
-    minute: tzDate.getMinutes(),
-    day: tzDate.getDay(),
-    fullTime: `${String(tzDate.getHours()).padStart(2, "0")}:${String(tzDate.getMinutes()).padStart(2, "0")}`,
+    hour:     h,
+    minute:   m,
+    day:      d.getDay(),           // 0 = Sun … 6 = Sat
+    fullTime: `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`,
   };
 };
 
+/**
+ * Extracts HH:MM from a dateTime string that may be either
+ *   "HH:MM"  or  "YYYY-MM-DDTHH:MM"
+ */
+const extractHHMM = (dateTime = "") =>
+  dateTime.includes("T") ? dateTime.split("T")[1].slice(0, 5) : dateTime.slice(0, 5);
+
 /* ================================================================
    IN-MEMORY SCHEDULE CACHE
+   Shape: { [userId]: { [scheduleId]: { ...schedule, fcmToken } } }
 ================================================================ */
-const schedulesCache = {};
+const scheduleCache = {};
 
 /* ================================================================
-   HELPER — is schedule due right now?
+   SECTION 1 — FIREBASE REALTIME LISTENER (cache sync)
+   Keeps scheduleCache in sync with DB without polling.
 ================================================================ */
+db.ref("/").on("value", (snapshot) => {
+  const allData = snapshot.val();
+  if (!allData) return;
+
+  for (const userId in allData) {
+    if (userId === "credentials") continue;
+
+    const userData  = allData[userId];
+    const schedules = userData?.Schedules;
+    const fcmToken  = userData?.fcmToken;
+
+    /* — User has no schedules → clear cache entry — */
+    if (!schedules || Object.keys(schedules).length === 0) {
+      if (scheduleCache[userId]) {
+        console.log(`[CACHE] 🗑  ${userId}: cleared (no schedules)`);
+        delete scheduleCache[userId];
+      }
+      continue;
+    }
+
+    const oldCache = scheduleCache[userId] || {};
+
+    /* — Log additions and deletions for visibility — */
+    const oldIds = new Set(Object.keys(oldCache));
+    const newIds = new Set(Object.keys(schedules));
+
+    for (const id of oldIds) {
+      if (!newIds.has(id)) {
+        console.log(`[CACHE] ❌ Removed  "${oldCache[id]?.applianceName}"  (${id}) — user: ${userId}`);
+      }
+    }
+    for (const id of newIds) {
+      if (!oldIds.has(id)) {
+        console.log(`[CACHE] ✅ Added    "${schedules[id]?.applianceName}"  (${id}) — user: ${userId}`);
+      }
+    }
+
+    /* — Rebuild cache entry — */
+    scheduleCache[userId] = {};
+    for (const scheduleId in schedules) {
+      scheduleCache[userId][scheduleId] = { ...schedules[scheduleId], fcmToken };
+    }
+
+    const count = Object.keys(scheduleCache[userId]).length;
+    console.log(`[CACHE] 📋 ${userId}: ${count} schedule(s) cached`);
+  }
+});
+
+/* ================================================================
+   SECTION 2 — MOTOR ALERT LISTENER
+   Sends a push notification when a farm sub-motor stops while the
+   main motor is running (i.e. the sub-motor failed).
+
+   Key schema (case-sensitive per Firebase):
+     M1, M2 …           — main motor on/off
+     M1name, M2name …   — motor display names
+     M1name1, M1name2 … — sub-motor names (scoped per motor)
+     M1working1 …       — sub-motor status (true = working)
+================================================================ */
+db.ref("/").on("child_changed", async (snapshot) => {
+  const userId   = snapshot.key;
+  if (userId === "credentials") return;
+
+  const userData = snapshot.val();
+  const token    = userData?.fcmToken;
+  if (!token) return;
+
+  // Iterate over all top-level keys that look like farm data nodes
+  for (const farmKey in userData) {
+    const farm = userData[farmKey];
+    if (!farm || typeof farm !== "object") continue;
+
+    // Find all main motor keys (M1, M2 …)
+    const motorKeys = Object.keys(farm).filter((k) => /^M\d+$/.test(k));
+
+    for (const motorKey of motorKeys) {
+      const motorNum = motorKey.replace("M", "");
+      if (farm[motorKey] !== true) continue;  // main motor must be ON
+
+      const motorName  = farm[`M${motorNum}name`] || `Motor ${motorNum}`;
+
+      // Find sub-motor status keys (M1working1, M1working2 …)
+      const subKeys = Object.keys(farm).filter((k) =>
+        new RegExp(`^M${motorNum}working\\d+$`).test(k)
+      );
+
+      for (const subKey of subKeys) {
+        if (farm[subKey] !== false) continue;  // only alert when sub-motor stopped
+
+        const subIdx  = subKey.replace(`M${motorNum}working`, "");
+        const subName = farm[`M${motorNum}name${subIdx}`] || `Sub Motor ${subIdx}`;
+
+        console.log(`[MOTOR] ⚠️  ${subName} of "${motorName}" stopped — user: ${userId}`);
+
+        try {
+          await admin.messaging().send({
+            notification: {
+              title: "⚠️ Motor Alert",
+              body:  `${subName} of ${motorName} has stopped working!`,
+            },
+            token,
+          });
+          console.log(`[MOTOR] 📲 Push notification sent — user: ${userId}`);
+        } catch (err) {
+          console.error(`[MOTOR] ❌ Push failed — ${err.message}`);
+        }
+      }
+    }
+  }
+});
+
+/* ================================================================
+   SECTION 3 — SCHEDULE EXECUTOR
+   Runs every 30 seconds. For each cached schedule, checks whether
+   it is due to fire (within a 2-minute window) and executes it.
+   A per-minute dedup set prevents double-firing.
+================================================================ */
+
+/** Returns true if the schedule should fire right now. */
 const isScheduleDue = (schedule) => {
-  const { hour, minute, day, fullTime } = getNowInUserTZ();
+  const { hour, minute, day, fullTime } = getNowIST();
+  const timePart                        = extractHHMM(schedule.dateTime);
+  const [schedH, schedM]               = timePart.split(":").map(Number);
 
-  const timePart = schedule.dateTime.includes("T")
-    ? schedule.dateTime.split("T")[1].slice(0, 5)
-    : schedule.dateTime.slice(0, 5);
+  const nowMins  = hour * 60 + minute;
+  const schedMin = schedH * 60 + schedM;
+  const diff     = nowMins - schedMin;
 
-  const [schedHour, schedMinute] = timePart.split(":").map(Number);
+  const timeMatches = diff >= 0 && diff <= 2;   // 0-2 min window covers missed ticks
 
   console.log(
-    `[CHECK] "${schedule.applianceName}": serverIST=${fullTime} scheduled=${timePart} repeat=${schedule.repeat}`
+    `[CHECK] "${schedule.applianceName}"` +
+    `  serverIST=${fullTime}  scheduled=${timePart}` +
+    `  diff=${diff}min  repeat=${schedule.repeat}  match=${timeMatches}`
   );
 
-  const nowTotalMins = hour * 60 + minute;
-  const schedTotalMins = schedHour * 60 + schedMinute;
-  const diff = nowTotalMins - schedTotalMins;
-
-  const timeMatches = diff >= 0 && diff <= 2;
   if (!timeMatches) return false;
 
   switch (schedule.repeat) {
@@ -71,234 +223,139 @@ const isScheduleDue = (schedule) => {
   }
 };
 
-/* ================================================================
-   FIREBASE REALTIME LISTENER
-================================================================ */
-db.ref("/").on("value", (snapshot) => {
-  const allData = snapshot.val();
-  if (!allData) return;
-
-  for (let userId in allData) {
-    if (userId === "credentials") continue;
-
-    const userData = allData[userId];
-    const schedules = userData?.Schedules;
-    const fcmToken = userData?.fcmToken;
-
-    if (!schedules) {
-      if (schedulesCache[userId]) {
-        console.log(`[CACHE] ${userId}: no schedules, clearing cache`);
-        delete schedulesCache[userId];
-      }
-      continue;
-    }
-
-    const oldCache = schedulesCache[userId] || {};
-    const oldIds = Object.keys(oldCache);
-    const newIds = Object.keys(schedules);
-
-    const deletedIds = oldIds.filter((id) => !newIds.includes(id));
-    const addedIds = newIds.filter((id) => !oldIds.includes(id));
-
-    deletedIds.forEach((id) => {
-      console.log(`[CACHE] ❌ Removed: "${oldCache[id]?.applianceName}" (${id}) for ${userId}`);
-    });
-    addedIds.forEach((id) => {
-      console.log(`[CACHE] ✅ Added: "${schedules[id]?.applianceName}" (${id}) for ${userId}`);
-    });
-
-    schedulesCache[userId] = {};
-    for (let scheduleId in schedules) {
-      schedulesCache[userId][scheduleId] = { ...schedules[scheduleId], fcmToken };
-    }
-
-    const count = Object.keys(schedulesCache[userId]).length;
-    console.log(`[CACHE] ${userId}: ${count} schedule(s) in cache`);
-    if (count === 0) delete schedulesCache[userId];
-  }
-});
-
-/* ================================================================
-   MOTOR ALERT LISTENER
-================================================================ */
-db.ref("/").on("child_changed", async (snapshot) => {
-  const userId = snapshot.key;
-  if (userId === "credentials") return;
-
-  const userData = snapshot.val();
-  const token = userData?.fcmToken;
-  if (!token) return;
-
-  for (let key in userData) {
-    if (!key.startsWith("farm_")) continue;
-
-    const farm = userData[key];
-    if (!farm || typeof farm !== "object") continue;
-
-    const motorKeys = Object.keys(farm).filter((k) => /^m\d+$/.test(k));
-
-    for (let motorKey of motorKeys) {
-      const motorNumber = motorKey.replace("m", "");
-      const mainMotorOn = farm[motorKey] === true;
-      if (!mainMotorOn) continue;
-
-      const motorName = farm[`m${motorNumber}name`] || `Motor ${motorNumber}`;
-      const subKeys = Object.keys(farm).filter((k) =>
-        new RegExp(`^m${motorNumber}working\\d+$`).test(k)
-      );
-
-      for (let subKey of subKeys) {
-        const subIndex = subKey.replace(`m${motorNumber}working`, "");
-        if (farm[subKey] === false) {
-          const subName = farm[`m${motorNumber}name${subIndex}`] || `Sub Motor ${subIndex}`;
-          console.log(`[MOTOR ALERT] ${subName} of ${motorName} stopped for ${userId}`);
-          try {
-            await admin.messaging().send({
-              notification: {
-                title: "⚠️ Motor Alert",
-                body: `${subName} of ${motorName} stopped working!`,
-              },
-              token,
-            });
-            console.log(`[MOTOR ALERT] Notification sent to ${userId}`);
-          } catch (err) {
-            console.error("[MOTOR ALERT] Error:", err.message);
-          }
-        }
-      }
-    }
-  }
-});
-
-/* ================================================================
-   SCHEDULE EXECUTOR — runs every 30s
-================================================================ */
+/* Tracks which schedules have already fired in the current minute */
 const executedThisMinute = new Set();
+let   lastMinuteKey      = "";
 
-const checkSchedules = () => {
-  const { fullTime } = getNowInUserTZ();
-  const totalUsers = Object.keys(schedulesCache).length;
+const executeSchedules = () => {
+  const { fullTime } = getNowIST();
 
-  if (checkSchedules._lastMinute !== fullTime) {
+  /* Reset dedup set on new minute */
+  if (fullTime !== lastMinuteKey) {
     executedThisMinute.clear();
-    checkSchedules._lastMinute = fullTime;
+    lastMinuteKey = fullTime;
   }
 
+  const totalUsers = Object.keys(scheduleCache).length;
   if (totalUsers === 0) {
-    console.log(`[SCHEDULE] ${fullTime} IST — no cached schedules`);
+    console.log(`[SCHEDULE] ⏱  ${fullTime} IST — no schedules cached`);
     return;
   }
 
-  console.log(`[SCHEDULE] ⏱ Tick at ${fullTime} IST — ${totalUsers} user(s)`);
+  console.log(`[SCHEDULE] ⏱  Tick ${fullTime} IST — ${totalUsers} user(s) to check`);
 
-  for (let userId in schedulesCache) {
-    const userSchedules = { ...schedulesCache[userId] };
+  for (const userId in scheduleCache) {
+    const userSchedules = { ...scheduleCache[userId] };
 
-    for (let scheduleId in userSchedules) {
-      const execKey = `${userId}-${scheduleId}-${fullTime}`;
-      if (executedThisMinute.has(execKey)) continue;
+    for (const scheduleId in userSchedules) {
+      const dedupKey = `${userId}-${scheduleId}-${fullTime}`;
+      if (executedThisMinute.has(dedupKey)) continue;
 
       const schedule = userSchedules[scheduleId];
       if (!isScheduleDue(schedule)) continue;
 
-      executedThisMinute.add(execKey);
+      executedThisMinute.add(dedupKey);
 
-      console.log(`[SCHEDULE] ⏰ Executing "${schedule.applianceName}" for ${userId} (${schedule.repeat})`);
+      const newValue = schedule.action === "on";
 
-      const appliancePath = `/${userId}/${schedule.addressId}/${schedule.applianceId}`;
-      const newValue = schedule.action === "on" ? true : false;
+      // Farm schedules store addressId as "farm_Basha" (FarmNames key) but the
+      // actual data node is written without the prefix → "/mahi/Basha/L1"
+      const dataNode     = schedule.addressId?.startsWith("farm_")
+        ? schedule.addressId.slice("farm_".length)
+        : schedule.addressId;
+      const appliancePath = `/${userId}/${dataNode}/${schedule.applianceId}`;
 
-      delete schedulesCache[userId][scheduleId];
+      console.log(
+        `[SCHEDULE] ⚡ Firing "${schedule.applianceName}"` +
+        `  action=${schedule.action}  path=${appliancePath}  user=${userId}`
+      );
+
+      /* Remove from cache (Once) or keep (Daily/Weekdays/Weekends) */
+      if (schedule.repeat === "Once") {
+        delete scheduleCache[userId][scheduleId];
+        console.log(`[SCHEDULE] 🗑  "${schedule.applianceName}" removed from cache (Once)`);
+      }
 
       db.ref(appliancePath)
         .set(newValue)
-        .then(async () => {
-          console.log(`[SCHEDULE] ✅ DB updated: ${appliancePath} → ${newValue}`);
-
-          if (schedule.repeat === "Once") {
-            await db.ref(`/${userId}/Schedules/${scheduleId}`).remove();
-            console.log(`[SCHEDULE] 🗑️ "${schedule.applianceName}" deleted (Once)`);
-          } else {
-            console.log(`[SCHEDULE] 🔁 "${schedule.applianceName}" kept for next (${schedule.repeat})`);
-          }
-
-          const token = schedule.fcmToken;
-          if (token) {
-            const statusText = schedule.action === "on" ? "turned ON" : "turned OFF";
-            try {
-              await admin.messaging().send({
-                notification: {
-                  title: "⏰ Schedule Executed",
-                  body: `${schedule.applianceName} has been ${statusText} automatically`,
-                },
-                token,
-              });
-              console.log(`[SCHEDULE] 🔔 Notification sent for "${schedule.applianceName}"`);
-            } catch (err) {
-              console.error("[SCHEDULE] Notification error:", err.message);
-            }
-          }
-        })
-        .catch((err) => console.error("[SCHEDULE] ❌ DB write error:", err.message));
+        .then(() => console.log(`[SCHEDULE] ✅ DB updated: ${appliancePath} → ${newValue}`))
+        .catch((err) => console.error(`[SCHEDULE] ❌ DB write failed: ${err.message}`));
     }
 
-    if (Object.keys(schedulesCache[userId] || {}).length === 0) {
-      delete schedulesCache[userId];
+    /* Clean up empty user entries */
+    if (Object.keys(scheduleCache[userId] || {}).length === 0) {
+      delete scheduleCache[userId];
     }
   }
 };
 
-// ✅ Single interval — no duplicates
-setInterval(checkSchedules, 30000);
-console.log("[SCHEDULE] Checker started — every 30s in IST");
-
-// ✅ Debug — auto stops after 10 minutes
-const debugInterval = setInterval(() => {
-  const { fullTime, hour, minute } = getNowInUserTZ();
-  for (let userId in schedulesCache) {
-    for (let scheduleId in schedulesCache[userId]) {
-      const schedule = schedulesCache[userId][scheduleId];
-      const timePart = schedule.dateTime.includes("T")
-        ? schedule.dateTime.split("T")[1].slice(0, 5)
-        : schedule.dateTime.slice(0, 5);
-      const [schedHour, schedMinute] = timePart.split(":").map(Number);
-      const diff = (hour * 60 + minute) - (schedHour * 60 + schedMinute);
-      console.log(`[DEBUG] now=${fullTime} scheduled=${timePart} diff=${diff}mins match=${diff >= 0 && diff <= 2}`);
-    }
-  }
-}, 5000);
-
-setTimeout(() => {
-  clearInterval(debugInterval);
-  console.log("[DEBUG] Debug stopped automatically");
-}, 10 * 60 * 1000);
+setInterval(executeSchedules, 30_000);
+console.log("[SCHEDULE] ✅ Executor started — fires every 30s in IST");
 
 /* ================================================================
-   EXPRESS ROUTES
+   SECTION 4 — EXPRESS ROUTES
 ================================================================ */
+
+/** GET / — health check + live cache status */
 app.get("/", (req, res) => {
-  const { fullTime } = getNowInUserTZ();
-  const cacheStatus = Object.entries(schedulesCache).map(([userId, schedules]) => ({
+  const { fullTime } = getNowIST();
+
+  const cacheStatus = Object.entries(scheduleCache).map(([userId, schedules]) => ({
     userId,
-    pending: Object.keys(schedules).length,
+    pendingCount: Object.keys(schedules).length,
     schedules: Object.values(schedules).map((s) => ({
-      name: s.applianceName,
-      time: s.dateTime,
-      repeat: s.repeat,
-      action: s.action,
+      name:    s.applianceName,
+      time:    extractHHMM(s.dateTime),
+      repeat:  s.repeat,
+      action:  s.action,
+      address: s.addressId,
     })),
   }));
 
   res.json({
-    status: "✅ Shemwave server running",
-    serverUTC: new Date().toISOString(),
-    serverIST: fullTime,
-    uptime: Math.floor(process.uptime()) + "s",
-    cachedUsers: cacheStatus.length,
-    cache: cacheStatus,
+    status:     "✅ Shemwave server running",
+    serverUTC:  new Date().toISOString(),
+    serverIST:  fullTime,
+    uptimeSecs: Math.floor(process.uptime()),
+    users:      cacheStatus.length,
+    cache:      cacheStatus,
   });
 });
 
+/** GET /cleanup — wipes all user data, preserves credentials (admin only) */
+// app.get("/cleanup", async (req, res) => {
+//   try {
+//     const credSnap    = await db.ref("/credentials").once("value");
+//     const credentials = credSnap.val();
+
+//     const rootSnap = await db.ref("/").once("value");
+//     const allData  = rootSnap.val();
+
+//     const deleted = [];
+//     for (const key in allData) {
+//       if (key === "credentials") continue;
+//       await db.ref(`/${key}`).remove();
+//       console.log(`[CLEANUP] 🗑  Deleted: ${key}`);
+//       deleted.push(key);
+//     }
+
+//     await db.ref("/credentials").set(credentials);
+//     console.log("[CLEANUP] ✅ Credentials restored");
+
+//     res.json({ status: "✅ Cleanup done", kept: "credentials", deleted });
+//   } catch (err) {
+//     console.error(`[CLEANUP] ❌ Error: ${err.message}`);
+//     res.status(500).json({ error: err.message });
+//   }
+// });
+
+/* ================================================================
+   SECTION 5 — SERVER START
+================================================================ */
 app.listen(PORT, () => {
-  console.log(`[SERVER] Running on port ${PORT}`);
+  console.log("╔══════════════════════════════════════════╗");
+  console.log(`║  Shemwave Server  |  Port ${PORT}           ║`);
+  console.log("║  Timezone: Asia/Kolkata (IST)            ║");
+  console.log("║  Schedule check: every 30s               ║");
+  console.log("╚══════════════════════════════════════════╝");
 });
